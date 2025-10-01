@@ -2,16 +2,11 @@ import { connect } from 'cloudflare:sockets';
 
 // --- CONFIGURATION ---
 const Config = {
-  proxyIPs: ['nima.nscl.ir:443'], // Fallback/Relay server (currently not used in the primary logic for stability)
+  proxyIPs: ['nima.nscl.ir:443'], // Fallback/Relay server
   scamalytics: {
     username: 'revilseptember',
     apiKey: 'b2fc368184deb3d8ac914bd776b8215fe899dd8fef69fbaba77511acfbdeca0d',
     baseUrl: 'https://api12.scamalytics.com/v3/',
-  },
-  socks5: {
-    enabled: false,
-    relayMode: false,
-    address: '',
   },
   fromEnv(env) {
     const selectedProxyIP = env.PROXYIP || this.proxyIPs[Math.floor(Math.random() * this.proxyIPs.length)];
@@ -25,11 +20,6 @@ const Config = {
         apiKey: env.SCAMALYTICS_API_KEY || this.scamalytics.apiKey,
         baseUrl: env.SCAMALYTICS_BASEURL || this.scamalytics.baseUrl,
       },
-      socks5: {
-        enabled: !!env.SOCKS5,
-        relayMode: env.SOCKS5_RELAY === 'true' || this.socks5.relayMode,
-        address: env.SOCKS5 || this.socks5.address,
-      },
     };
   },
 };
@@ -39,101 +29,34 @@ const CONST = {
   WS_READY_STATE_CLOSING: 2,
 };
 
-// --- CORE LOGIC & LINK GENERATION (No changes here) ---
-function generateRandomPath(length = 12, query = '') {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let result = '';
-  for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return `/${result}${query ? `?${query}` : ''}`;
-}
-
-const CORE_PRESETS = {
-  xray: {
-    tls: { path: () => generateRandomPath(12, 'ed=2048'), security: 'tls', fp: 'chrome', alpn: 'http/1.1', extra: {} },
-    tcp: { path: () => generateRandomPath(12, 'ed=2048'), security: 'none', fp: 'chrome', extra: {} },
-  },
-  sb: {
-    tls: { path: () => generateRandomPath(18), security: 'tls', fp: 'firefox', alpn: 'h3', extra: { ed: 2560 } },
-    tcp: { path: () => generateRandomPath(18), security: 'none', fp: 'firefox', extra: { ed: 2560 } },
-  },
-};
-
-function makeName(tag, proto) { return `${tag}-${proto.toUpperCase()}`; }
-
-function createVlessLink({ userID, address, port, host, path, security, sni, fp, alpn, extra = {}, name }) {
-  const params = new URLSearchParams({ type: 'ws', host, path });
-  if (security) params.set('security', security);
-  if (sni) params.set('sni', sni);
-  if (fp) params.set('fp', fp);
-  if (alpn) params.set('alpn', alpn);
-  for (const [k, v] of Object.entries(extra)) params.set(k, v);
-  return `vless://${userID}@${address}:${port}?${params.toString()}#${encodeURIComponent(name)}`;
-}
-
-function buildLink({ core, proto, userID, hostName, address, port, tag }) {
-  const p = CORE_PRESETS[core][proto];
-  return createVlessLink({
-    userID, address, port, host: hostName, path: p.path(), security: p.security,
-    sni: p.security === 'tls' ? hostName : undefined, fp: p.fp, alpn: p.alpn, extra: p.extra, name: makeName(tag, proto),
-  });
-}
-
-const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
-
-async function handleIpSubscription(core, userID, hostName) {
-  const mainDomains = [ hostName, 'creativecommons.org', 'www.speedtest.net', 'cf.090227.xyz', 'cdnjs.com', 'zula.ir', 'go.inmobi.com', 'singapore.com', 'www.visa.com' ];
-  const httpsPorts = [443, 8443, 2053, 2083, 2087, 2096];
-  const httpPorts = [80, 8080, 8880, 2052, 2082, 2086, 2095];
-  let links = [];
-  const isPagesDeployment = hostName.endsWith('.pages.dev');
-  mainDomains.forEach((domain, i) => {
-    links.push(buildLink({ core, proto: 'tls', userID, hostName, address: domain, port: pick(httpsPorts), tag: `D${i + 1}` }));
-    if (!isPagesDeployment) {
-      links.push(buildLink({ core, proto: 'tcp', userID, hostName, address: domain, port: pick(httpPorts), tag: `D${i + 1}` }));
-    }
-  });
-  try {
-    const r = await fetch('https://raw.githubusercontent.com/NiREvil/vless/main/Cloudflare-IPs.json');
-    if (r.ok) {
-      const json = await r.json();
-      const ips = [...(json.ipv4 || []), ...(json.ipv6 || [])].slice(0, 20).map(x => x.ip);
-      ips.forEach((ip, i) => {
-        const formattedAddress = ip.includes(':') ? `[${ip}]` : ip;
-        links.push(buildLink({ core, proto: 'tls', userID, hostName, address: formattedAddress, port: pick(httpsPorts), tag: `IP${i + 1}` }));
-        if (!isPagesDeployment) {
-          links.push(buildLink({ core, proto: 'tcp', userID, hostName, address: formattedAddress, port: pick(httpPorts), tag: `IP${i + 1}` }));
-        }
-      });
-    }
-  } catch (e) { console.error('Failed to fetch IP list:', e); }
-  return new Response(btoa(links.join('\n')), { headers: { 'Content-Type': 'text/plain;charset=utf-8' } });
-}
-
 // --- MAIN FETCH HANDLER ---
 export default {
   async fetch(request, env, ctx) {
     try {
-      const url = new URL(request.url);
-      const cfg = Config.fromEnv(env);
       if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
         return handleWebSocket(request, env, ctx);
       }
-      // --- Admin, Subscription, and other HTTP routes (No changes here) ---
+      const url = new URL(request.url);
+      const cfg = Config.fromEnv(env);
+      // --- HTTP routes for Admin Panel, Subscriptions, etc. ---
       if (!env.DB || !env.KV) return new Response('Service Unavailable: D1 or KV binding is not configured.', { status: 503 });
       if (!env.ADMIN_KEY) console.error('CRITICAL: ADMIN_KEY secret is not set in environment variables.');
       if (url.pathname === '/scamalytics-lookup') return handleScamalyticsLookup(request, cfg);
       if (url.pathname.startsWith('/admin')) return handleAdminRoutes(request, env);
       const parts = url.pathname.slice(1).split('/');
       let userID;
-      if (parts[0] === 'users' && parts.length > 1) userID = parts[1];
-      else if ((parts[0] === 'xray' || parts[0] === 'sb') && parts.length > 1) {
+      if ((parts[0] === 'xray' || parts[0] === 'sb') && parts.length > 1) {
         userID = parts[1];
         if (await isValidUser(userID, env, ctx)) return handleIpSubscription(parts[0], userID, url.hostname);
-      } else if (parts.length === 1 && isValidUUID(parts[0])) userID = parts[0];
-      if (userID && await isValidUser(userID, env, ctx)) return handleConfigPage(userID, url.hostname, cfg.proxyAddress);
-      return new Response('404 - Not Found', { status: 404 });
+      } else if (parts[0] === 'users' && parts.length > 1) {
+        userID = parts[1];
+      } else if (parts.length === 1 && isValidUUID(parts[0])) {
+        userID = parts[0];
+      }
+      if (userID && await isValidUser(userID, env, ctx)) {
+        return handleConfigPage(userID, url.hostname, cfg.proxyAddress);
+      }
+      return new Response('404 Not Found', { status: 404 });
     } catch (err) {
       console.error('Unhandled Exception:', err);
       return new Response('Internal Server Error', { status: 500 });
@@ -141,131 +64,129 @@ export default {
   },
 };
 
-// --- WEBSOCKET HANDLER ---
+// --- WEBSOCKET & PROXY LOGIC ---
 async function handleWebSocket(request, env, ctx) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
   webSocket.accept();
 
-  let earlyDataHeader = request.headers.get('Sec-WebSocket-Protocol') || '';
-  const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, (e) => console.log(e));
+  const log = (info, event) => console.log(`[WS] ${info}`, event || '');
+  const earlyDataHeader = request.headers.get('Sec-WebSocket-Protocol') || '';
+  const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
   
-  // This stream will handle the VLESS header and proxying.
+  let remoteSocketWrapper = { value: null };
+  let isHeaderProcessed = false;
+
   readableWebSocketStream.pipeTo(new WritableStream({
     async write(chunk, controller) {
-      const { hasError, message, addressRemote, portRemote, rawDataIndex, ProtocolVersion, isUDP } = await processVlessHeader(chunk, env, ctx);
-      
-      if (hasError) {
-        console.error(`VLESS processing error: ${message}`);
-        controller.error(new Error(message));
+      if (isHeaderProcessed && remoteSocketWrapper.value) {
+        const writer = remoteSocketWrapper.value.writable.getWriter();
+        try {
+          await writer.write(chunk);
+        } finally {
+          writer.releaseLock();
+        }
         return;
       }
 
+      // This part runs only for the first chunk
+      const { hasError, message, addressRemote, portRemote, rawDataIndex, ProtocolVersion, isUDP } = await processVlessHeader(chunk, env, ctx);
+
+      if (hasError) {
+        log(`VLESS Header Error: ${message}`);
+        return controller.error(new Error(message));
+      }
       if (isUDP) {
-          console.error('UDP is not supported in this version.');
-          controller.error(new Error('UDP not supported.'));
-          return;
+        log('UDP is not supported.');
+        return controller.error(new Error('UDP not supported'));
       }
       
-      const rawClientData = chunk.slice(rawDataIndex);
-
-      // This is the new, robust connection handler.
-      // It attempts to connect to the destination and only then confirms to the client.
-      await handleTCPOutbound({
-          addressRemote,
-          portRemote,
-          vlessResponseHeader: new Uint8Array([ProtocolVersion[0], 0]),
-          initialClientData: rawClientData,
-          webSocket,
-          readableWebSocketStream,
-          log: (msg) => console.log(`[${addressRemote}:${portRemote}] ${msg}`),
+      const initialClientData = chunk.slice(rawDataIndex);
+      
+      // The most intelligent part: Connect, confirm, then pipe.
+      const remoteSocket = await handleTCPOutbound({
+        addressRemote,
+        portRemote,
+        vlessResponseHeader: new Uint8Array([ProtocolVersion[0], 0]),
+        initialClientData,
+        webSocket,
+        log: (msg, ev) => console.log(`[${addressRemote}:${portRemote}] ${msg}`, ev || ''),
       });
 
-      // After the connection is established and piped, we can close this initial stream.
-      controller.close();
+      if (!remoteSocket) {
+        return controller.error(new Error('Failed to establish remote connection.'));
+      }
+      
+      remoteSocketWrapper.value = remoteSocket;
+      isHeaderProcessed = true;
+
+      // Start piping data from remote back to client
+      remoteSocket.readable
+        .pipeTo(new WritableStream({
+          write(chunk) {
+            if (webSocket.readyState === CONST.WS_READY_STATE_OPEN) {
+              webSocket.send(chunk);
+            }
+          },
+          close: () => log('Remote socket readable stream closed.'),
+          abort: (err) => log('Remote socket readable stream aborted:', err),
+        }))
+        .catch(err => log('Error piping remote to WebSocket:', err));
     },
-    abort(err) {
-      console.error('Initial stream aborted:', err);
-    },
-  })).catch((err) => {
-    console.error('Main pipeline failed:', err);
+    abort: (err) => log('WebSocket readable stream aborted:', err),
+  }))
+  .catch(err => {
+    log('WebSocket pipeline failed:', err);
     safeCloseWebSocket(webSocket);
   });
 
   return new Response(null, { status: 101, webSocket: client });
 }
 
-
-// --- START: MODIFIED INTELLIGENT OUTBOUND LOGIC ---
 /**
- * Handles the outbound TCP connection.
- * It connects to the destination, sends the VLESS confirmation, and then pipes data in both directions.
+ * Connects to the destination and performs the handshake.
+ * Returns the connected remote socket if successful.
  */
-async function handleTCPOutbound({ addressRemote, portRemote, vlessResponseHeader, initialClientData, webSocket, readableWebSocketStream, log }) {
-  let remoteSocket;
+async function handleTCPOutbound({ addressRemote, portRemote, vlessResponseHeader, initialClientData, webSocket, log }) {
   try {
-    // 1. Attempt to connect to the real destination.
-    log('Attempting to connect...');
-    remoteSocket = await connect({ hostname: addressRemote, port: portRemote });
+    log('Connecting to destination...');
+    const remoteSocket = await connect({ hostname: addressRemote, port: portRemote });
     log('Connection successful.');
 
-    // 2. ONLY AFTER a successful connection, send the confirmation back to the client.
-    // This prevents the "hanging" state.
+    // Handshake complete: Confirm connection to the client
     if (webSocket.readyState === CONST.WS_READY_STATE_OPEN) {
       webSocket.send(vlessResponseHeader);
     }
 
-    // 3. Pipe data in both directions simultaneously.
+    // Write the first packet of data
     const writer = remoteSocket.writable.getWriter();
-    await writer.write(initialClientData); // Write the first chunk of data.
+    await writer.write(initialClientData);
     writer.releaseLock();
-    
-    log('Piping data...');
-    // Pipe remote socket back to the client WebSocket.
-    const remoteToWS = remoteSocket.readable.pipeTo(new WritableStream({
-      write(chunk) {
-        if (webSocket.readyState === CONST.WS_READY_STATE_OPEN) {
-          webSocket.send(chunk);
-        }
-      },
-      close() {
-        log('Remote socket closed.');
-      },
-      abort(err) {
-        log('Remote socket aborted:', err);
-      },
-    }));
 
-    // Pipe the client WebSocket to the remote socket.
-    const wsToRemote = readableWebSocketStream.pipeTo(remoteSocket.writable);
-    
-    // Wait for both pipes to complete. If one fails, the other will be cancelled.
-    await Promise.all([remoteToWS, wsToRemote]);
-    log('Piping finished.');
-
+    return remoteSocket;
   } catch (error) {
-    log(`Outbound connection error: ${error.message}`);
-    // If anything fails, ensure the connection is properly closed.
-    if (remoteSocket) remoteSocket.close();
+    log(`Connection to ${addressRemote}:${portRemote} failed`, error);
     safeCloseWebSocket(webSocket, 1011, `Proxy connection failed: ${error.message}`);
-    throw error; // Re-throw the error to be caught by the main handler.
+    return null;
   }
 }
-// --- END: MODIFIED INTELLIGENT OUTBOUND LOGIC ---
 
-
-// --- VLESS & UTILITY FUNCTIONS (minor changes for robustness) ---
+// --- VLESS & UTILITY FUNCTIONS ---
 async function processVlessHeader(vlessBuffer, env, ctx) {
-  if (vlessBuffer.byteLength < 24) return { hasError: true, message: 'invalid data' };
+  if (vlessBuffer.byteLength < 24) return { hasError: true, message: 'Invalid VLESS header' };
   const dataView = new DataView(vlessBuffer);
   const version = dataView.getUint8(0);
   const uuid = stringify(new Uint8Array(vlessBuffer.slice(1, 17)));
-  if (!await isValidUser(uuid, env, ctx)) return { hasError: true, message: 'invalid user' };
+
+  // This check is now robust.
+  if (!await isValidUser(uuid, env, ctx)) return { hasError: true, message: 'Invalid user' };
+
   const optLength = dataView.getUint8(17);
   const command = dataView.getUint8(18 + optLength);
   const portIndex = 18 + optLength + 1;
   const portRemote = dataView.getUint16(portIndex);
   const addressType = dataView.getUint8(portIndex + 2);
+
   let addressRemote, rawDataIndex;
   switch (addressType) {
     case 1: // IPv4
@@ -283,13 +204,42 @@ async function processVlessHeader(vlessBuffer, env, ctx) {
       rawDataIndex = portIndex + 19;
       break;
     default:
-      return { hasError: true, message: `invalid addressType: ${addressType}` };
+      return { hasError: true, message: `Invalid addressType: ${addressType}` };
   }
+
   return {
     hasError: false, addressRemote, portRemote, rawDataIndex,
     ProtocolVersion: new Uint8Array([version]), isUDP: command === 2,
   };
 }
+
+const isValidUUID = (uuid) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(uuid);
+
+async function isValidUser(userID, env, ctx) {
+    if (!isValidUUID(userID)) return false;
+    const cacheKey = `user:${userID}`;
+    const cached = await env.KV.get(cacheKey);
+    if (cached === 'valid') return true;
+    if (cached === 'invalid') return false;
+
+    try {
+        const now = Math.floor(Date.now() / 1000);
+        // Corrected to use env.DB directly as per user's original code.
+        const stmt = env.DB.prepare('SELECT expiration_timestamp, status FROM users WHERE id = ?');
+        const user = await stmt.bind(userID).first();
+        if (!user || user.expiration_timestamp < now || user.status !== 'active') {
+            await env.KV.put(cacheKey, 'invalid', { expirationTtl: 3600 });
+            return false;
+        }
+        ctx.waitUntil(env.DB.prepare('UPDATE users SET last_accessed = ? WHERE id = ?').bind(now, userID).run());
+        await env.KV.put(cacheKey, 'valid', { expiration: user.expiration_timestamp });
+        return true;
+    } catch (e) {
+        console.error('D1 query failed in isValidUser:', e);
+        return false;
+    }
+}
+
 
 function makeReadableWebSocketStream(webSocket, earlyData, log) {
   let readableStreamCancel = false;
@@ -305,42 +255,23 @@ function makeReadableWebSocketStream(webSocket, earlyData, log) {
       });
       webSocket.addEventListener('error', (err) => {
         if (readableStreamCancel) return;
-        log('WebSocket error');
+        log('WebSocket error', err);
         controller.error(err);
       });
       const { earlyData: parsedEarlyData, error } = base64ToArrayBuffer(earlyData);
       if (error) {
-        if (readableStreamCancel) return;
         controller.error(error);
       } else if (parsedEarlyData) {
-        if (readableStreamCancel) return;
         controller.enqueue(parsedEarlyData);
       }
     },
     pull() {},
     cancel(reason) {
-      log(`ReadableStream was cancelled, reason: ${reason}`);
+      log(`ReadableStream cancelled`, reason);
       readableStreamCancel = true;
       safeCloseWebSocket(webSocket);
     },
   });
-}
-
-const isValidUUID = (uuid) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(uuid);
-
-async function isValidUser(userID, env, ctx) {
-  if (!isValidUUID(userID)) return false;
-  const cacheKey = `user:${userID}`;
-  const cached = await env.KV.get(cacheKey);
-  if (cached) return cached === 'valid';
-  const { D1_binding: DB, KV_binding: KV } = env; // Assuming bindings are named this way
-  const now = Math.floor(Date.now() / 1000);
-  const stmt = DB.prepare('SELECT expiration_timestamp FROM users WHERE id = ? AND status = \'active\'');
-  const user = await stmt.bind(userID).first();
-  const isValid = user && user.expiration_timestamp > now;
-  await KV.put(cacheKey, isValid ? 'valid' : 'invalid', { expiration: user ? user.expiration_timestamp : now + 3600 });
-  if (isValid) ctx.waitUntil(DB.prepare('UPDATE users SET last_accessed = ? WHERE id = ?').bind(now, userID).run());
-  return isValid;
 }
 
 function safeCloseWebSocket(socket, code, reason) {
@@ -354,9 +285,10 @@ function safeCloseWebSocket(socket, code, reason) {
 const byteToHex = Array.from({ length: 256 }, (_, i) => (i + 0x100).toString(16).slice(1));
 function stringify(arr) {
   const uuid = (
-    byteToHex[arr[0]] + byteToHex[arr[1]] + byteToHex[arr[2]] + byteToHex[arr[3]] + '-' +
-    byteToHex[arr[4]] + byteToHex[arr[5]] + '-' + byteToHex[arr[6]] + byteToHex[arr[7]] + '-' +
-    byteToHex[arr[8]] + byteToHex[arr[9]] + '-' + byteToHex[arr[10]] + byteToHex[arr[11]] + byteToHex[arr[12]] + byteToHex[arr[13]] + byteToHex[arr[14]] + byteToHex[arr[15]]
+    byteToHex[arr[0]]+byteToHex[arr[1]]+byteToHex[arr[2]]+byteToHex[arr[3]]+'-'+
+    byteToHex[arr[4]]+byteToHex[arr[5]]+'-'+byteToHex[arr[6]]+byteToHex[arr[7]]+'-'+
+    byteToHex[arr[8]]+byteToHex[arr[9]]+'-'+
+    byteToHex[arr[10]]+byteToHex[arr[11]]+byteToHex[arr[12]]+byteToHex[arr[13]]+byteToHex[arr[14]]+byteToHex[arr[15]]
   ).toLowerCase();
   if (!isValidUUID(uuid)) throw new TypeError('Invalid UUID');
   return uuid;
@@ -370,16 +302,101 @@ function base64ToArrayBuffer(base64Str) {
         const view = new Uint8Array(buffer);
         for (let i = 0; i < binaryStr.length; i++) view[i] = binaryStr.charCodeAt(i);
         return { earlyData: buffer, error: null };
-    } catch (error) {
-        return { earlyData: null, error };
-    }
+    } catch (error) { return { earlyData: null, error }; }
 }
 
+// --- ALL OTHER FUNCTIONS (Admin Panel, HTML pages, subscriptions, etc.) ---
+// --- Paste the unchanged functions from your original script here ---
+// --- For brevity, they are omitted, but you need them for the script to be complete ---
 
-// --- All other functions (Admin Panel, HTML pages, etc.) remain unchanged ---
-// ... (The rest of your code for admin, HTML generation, etc., goes here without any changes)
-// Note: For brevity, I'm omitting the identical functions like `handleAdminRoutes`, `getPageCSS`, etc.
-// You should paste them back in from your original script.
+// --- CORE LOGIC & LINK GENERATION ---
+function generateRandomPath(length = 12, query = '') {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return `/${result}${query ? `?${query}` : ''}`;
+}
+
+const CORE_PRESETS = {
+  xray: {
+    tls: { path: () => generateRandomPath(12, 'ed=2048'), security: 'tls', fp: 'chrome', alpn: 'http/1.1', extra: {} },
+    tcp: { path: () => generateRandomPath(12, 'ed=2048'), security: 'none', fp: 'chrome', extra: {} },
+  },
+  sb: {
+    tls: { path: () => generateRandomPath(18), security: 'tls', fp: 'firefox', alpn: 'h3', extra: {ed: 2560} },
+    tcp: { path: () => generateRandomPath(18), security: 'none', fp: 'firefox', extra: {ed: 2560} },
+  },
+};
+
+function makeName(tag, proto) {
+  return `${tag}-${proto.toUpperCase()}`;
+}
+
+function createVlessLink({ userID, address, port, host, path, security, sni, fp, alpn, extra = {}, name }) {
+  const params = new URLSearchParams({ type: 'ws', host, path });
+  if (security) params.set('security', security);
+  if (sni) params.set('sni', sni);
+  if (fp) params.set('fp', fp);
+  if (alpn) params.set('alpn', alpn);
+  for (const [k, v] of Object.entries(extra)) params.set(k, v);
+  return `vless://${userID}@${address}:${port}?${params.toString()}#${encodeURIComponent(name)}`;
+}
+
+function buildLink({ core, proto, userID, hostName, address, port, tag }) {
+  const p = CORE_PRESETS[core][proto];
+  return createVlessLink({
+    userID,
+    address,
+    port,
+    host: hostName,
+    path: p.path(),
+    security: p.security,
+    sni: p.security === 'tls' ? hostName : undefined,
+    fp: p.fp,
+    alpn: p.alpn,
+    extra: p.extra,
+    name: makeName(tag, proto),
+  });
+}
+
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+async function handleIpSubscription(core, userID, hostName) {
+  const mainDomains = [
+    hostName, 'creativecommons.org', 'www.speedtest.net',
+    'sky.rethinkdns.com', 'cf.090227.xyz', 'cdnjs.com', 'zula.ir',
+    'cfip.1323123.xyz', 'cfip.xxxxxxxx.tk',
+    'go.inmobi.com', 'singapore.com', 'www.visa.com',
+  ];
+  const httpsPorts = [443, 8443, 2053, 2083, 2087, 2096];
+  const httpPorts = [80, 8080, 8880, 2052, 2082, 2086, 2095];
+  let links = [];
+  const isPagesDeployment = hostName.endsWith('.pages.dev');
+  mainDomains.forEach((domain, i) => {
+    links.push(buildLink({ core, proto: 'tls', userID, hostName, address: domain, port: pick(httpsPorts), tag: `D${i + 1}` }));
+    if (!isPagesDeployment) {
+      links.push(buildLink({ core, proto: 'tcp', userID, hostName, address: domain, port: pick(httpPorts), tag: `D${i + 1}` }));
+    }
+  });
+  try {
+    const r = await fetch('https://raw.githubusercontent.com/NiREvil/vless/refs/heads/main/Cloudflare-IPs.json');
+    if (r.ok) {
+      const json = await r.json();
+      const ips = [...(json.ipv4 || []), ...(json.ipv6 || [])].slice(0, 20).map(x => x.ip);
+      ips.forEach((ip, i) => {
+        const formattedAddress = ip.includes(':') ? `[${ip}]` : ip;
+        links.push(buildLink({ core, proto: 'tls', userID, hostName, address: formattedAddress, port: pick(httpsPorts), tag: `IP${i + 1}` }));
+        if (!isPagesDeployment) {
+          links.push(buildLink({ core, proto: 'tcp', userID, hostName, address: formattedAddress, port: pick(httpPorts), tag: `IP${i + 1}` }));
+        }
+      });
+    }
+  } catch (e) { console.error('Failed to fetch IP list:', e); }
+  return new Response(btoa(links.join('\n')), { headers: { 'Content-Type': 'text/plain;charset=utf-8' } });
+}
+
 // --- ADMIN PANEL API & UI ---
 async function handleAdminRoutes(request, env) {
   const url = new URL(request.url);
