@@ -1,8 +1,17 @@
+//
+// -----------------------------------------------------
+// 🚀 VLESS Proxy Worker - Enhanced & Optimized Script 🚀
+// -----------------------------------------------------
+// This script includes an intelligent, server-side rendered
+// network information panel for maximum speed and reliability.
+//
+
 import { connect } from 'cloudflare:sockets';
 
 // --- CONFIGURATION ---
 const Config = {
-  proxyIPs: ['nima.nscl.ir:443'], // Fallback/Relay server
+  // Fallback/Relay server if PROXYIP environment variable is not set
+  proxyIPs: ['nima.nscl.ir:443'],
   scamalytics: {
     username: 'revilseptember',
     apiKey: 'b2fc368184deb3d8ac914bd776b8215fe899dd8fef69fbaba77511acfbdeca0d',
@@ -38,31 +47,105 @@ export default {
       }
       const url = new URL(request.url);
       const cfg = Config.fromEnv(env);
+
+      // --- SMART API ENDPOINT FOR NETWORK INFO ---
+      if (url.pathname === '/api/network-info') {
+        return handleNetworkInfo(request, cfg);
+      }
+
       // --- HTTP routes for Admin Panel, Subscriptions, etc. ---
       if (!env.DB || !env.KV) return new Response('Service Unavailable: D1 or KV binding is not configured.', { status: 503 });
       if (!env.ADMIN_KEY) console.error('CRITICAL: ADMIN_KEY secret is not set in environment variables.');
-      if (url.pathname === '/scamalytics-lookup') return handleScamalyticsLookup(request, cfg);
+      
       if (url.pathname.startsWith('/admin')) return handleAdminRoutes(request, env);
+      
       const parts = url.pathname.slice(1).split('/');
       let userID;
       if ((parts[0] === 'xray' || parts[0] === 'sb') && parts.length > 1) {
         userID = parts[1];
         if (await isValidUser(userID, env, ctx)) return handleIpSubscription(parts[0], userID, url.hostname);
-      } else if (parts[0] === 'users' && parts.length > 1) {
-        userID = parts[1];
       } else if (parts.length === 1 && isValidUUID(parts[0])) {
         userID = parts[0];
       }
+      
       if (userID && await isValidUser(userID, env, ctx)) {
         return handleConfigPage(userID, url.hostname, cfg.proxyAddress);
       }
-      return new Response('404 Not Found', { status: 404 });
+      
+      return new Response('404 Not Found. Please use your unique user ID in the URL.', { status: 404 });
     } catch (err) {
       console.error('Unhandled Exception:', err);
       return new Response('Internal Server Error', { status: 500 });
     }
   },
 };
+
+// --- NEW SMART API ENDPOINT FOR NETWORK INFO ---
+async function handleNetworkInfo(request, config) {
+    const clientIp = request.headers.get('CF-Connecting-IP');
+    const proxyHost = config.proxyIP;
+
+    // Helper to fetch IP details from a reliable provider
+    const getIpDetails = async (ip) => {
+        if (!ip) return null;
+        try {
+            const response = await fetch(`https://ipinfo.io/${ip}/json`);
+            if (!response.ok) throw new Error(`ipinfo.io status: ${response.status}`);
+            const data = await response.json();
+            return {
+                ip: data.ip,
+                city: data.city,
+                country: data.country,
+                countryName: data.country, // ipinfo provides country code
+                isp: data.org,
+            };
+        } catch (error) {
+            console.error(`Failed to fetch details for IP ${ip}:`, error);
+            return { ip }; // Return at least the IP
+        }
+    };
+
+    // Helper to get Scamalytics data
+    const getScamalyticsDetails = async (ip) => {
+        if (!ip || !config.scamalytics.apiKey || !config.scamalytics.username) return null;
+        try {
+            const url = `${config.scamalytics.baseUrl}${config.scamalytics.username}/?key=${config.scamalytics.apiKey}&ip=${ip}`;
+            const response = await fetch(url);
+            if (!response.ok) throw new Error(`Scamalytics status: ${response.status}`);
+            const data = await response.json();
+            return (data.status === 'ok') ? { score: data.score, risk: data.risk } : null;
+        } catch (error) {
+            console.error(`Failed to fetch Scamalytics for IP ${ip}:`, error);
+            return null;
+        }
+    };
+    
+    // Fetch all data in parallel for maximum speed
+    const [clientDetails, proxyDetails, scamalyticsData] = await Promise.all([
+        getIpDetails(clientIp),
+        getIpDetails(proxyHost),
+        getScamalyticsDetails(clientIp)
+    ]);
+    
+    const responseData = {
+        client: {
+            ...clientDetails,
+            risk: scamalyticsData,
+        },
+        proxy: {
+            host: config.proxyAddress,
+            ...proxyDetails
+        }
+    };
+    
+    return new Response(JSON.stringify(responseData), {
+        headers: { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*' 
+        },
+    });
+}
+
 
 // --- WEBSOCKET & PROXY LOGIC ---
 async function handleWebSocket(request, env, ctx) {
@@ -89,7 +172,6 @@ async function handleWebSocket(request, env, ctx) {
         return;
       }
 
-      // This part runs only for the first chunk
       const { hasError, message, addressRemote, portRemote, rawDataIndex, ProtocolVersion, isUDP } = await processVlessHeader(chunk, env, ctx);
 
       if (hasError) {
@@ -103,7 +185,6 @@ async function handleWebSocket(request, env, ctx) {
       
       const initialClientData = chunk.slice(rawDataIndex);
       
-      // The most intelligent part: Connect, confirm, then pipe.
       const remoteSocket = await handleTCPOutbound({
         addressRemote,
         portRemote,
@@ -120,7 +201,6 @@ async function handleWebSocket(request, env, ctx) {
       remoteSocketWrapper.value = remoteSocket;
       isHeaderProcessed = true;
 
-      // Start piping data from remote back to client
       remoteSocket.readable
         .pipeTo(new WritableStream({
           write(chunk) {
@@ -143,22 +223,16 @@ async function handleWebSocket(request, env, ctx) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-/**
- * Connects to the destination and performs the handshake.
- * Returns the connected remote socket if successful.
- */
 async function handleTCPOutbound({ addressRemote, portRemote, vlessResponseHeader, initialClientData, webSocket, log }) {
   try {
     log('Connecting to destination...');
     const remoteSocket = await connect({ hostname: addressRemote, port: portRemote });
     log('Connection successful.');
 
-    // Handshake complete: Confirm connection to the client
     if (webSocket.readyState === CONST.WS_READY_STATE_OPEN) {
       webSocket.send(vlessResponseHeader);
     }
 
-    // Write the first packet of data
     const writer = remoteSocket.writable.getWriter();
     await writer.write(initialClientData);
     writer.releaseLock();
@@ -178,7 +252,6 @@ async function processVlessHeader(vlessBuffer, env, ctx) {
   const version = dataView.getUint8(0);
   const uuid = stringify(new Uint8Array(vlessBuffer.slice(1, 17)));
 
-  // This check is now robust.
   if (!await isValidUser(uuid, env, ctx)) return { hasError: true, message: 'Invalid user' };
 
   const optLength = dataView.getUint8(17);
@@ -224,7 +297,6 @@ async function isValidUser(userID, env, ctx) {
 
     try {
         const now = Math.floor(Date.now() / 1000);
-        // Corrected to use env.DB directly as per user's original code.
         const stmt = env.DB.prepare('SELECT expiration_timestamp, status FROM users WHERE id = ?');
         const user = await stmt.bind(userID).first();
         if (!user || user.expiration_timestamp < now || user.status !== 'active') {
@@ -286,7 +358,8 @@ const byteToHex = Array.from({ length: 256 }, (_, i) => (i + 0x100).toString(16)
 function stringify(arr) {
   const uuid = (
     byteToHex[arr[0]]+byteToHex[arr[1]]+byteToHex[arr[2]]+byteToHex[arr[3]]+'-'+
-    byteToHex[arr[4]]+byteToHex[arr[5]]+'-'+byteToHex[arr[6]]+byteToHex[arr[7]]+'-'+
+    byteToHex[arr[4]]+byteToHex[arr[5]]+'-'+
+    byteToHex[arr[6]]+byteToHex[arr[7]]+'-'+
     byteToHex[arr[8]]+byteToHex[arr[9]]+'-'+
     byteToHex[arr[10]]+byteToHex[arr[11]]+byteToHex[arr[12]]+byteToHex[arr[13]]+byteToHex[arr[14]]+byteToHex[arr[15]]
   ).toLowerCase();
@@ -306,8 +379,6 @@ function base64ToArrayBuffer(base64Str) {
 }
 
 // --- ALL OTHER FUNCTIONS (Admin Panel, HTML pages, subscriptions, etc.) ---
-// --- Paste the unchanged functions from your original script here ---
-// --- For brevity, they are omitted, but you need them for the script to be complete ---
 
 // --- CORE LOGIC & LINK GENERATION ---
 function generateRandomPath(length = 12, query = '') {
@@ -367,7 +438,7 @@ async function handleIpSubscription(core, userID, hostName) {
   const mainDomains = [
     hostName, 'creativecommons.org', 'www.speedtest.net',
     'sky.rethinkdns.com', 'cf.090227.xyz', 'cdnjs.com', 'zula.ir',
-    'cfip.1323123.xyz', 'cfip.xxxxxxxx.tk',
+    'cfip.1323123.xyz',
     'go.inmobi.com', 'singapore.com', 'www.visa.com',
   ];
   const httpsPorts = [443, 8443, 2053, 2083, 2087, 2096];
@@ -415,7 +486,6 @@ async function handleAdminRoutes(request, env) {
     return Response.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  // Protected API Routes
   try {
     if (request.method === 'POST' && path === '/api/users') {
       const body = await request.json();
@@ -548,60 +618,30 @@ function getAdminDashboardHTML() {
   </script></body></html>`;
 }
 
-async function handleScamalyticsLookup(request, config) {
-  const url = new URL(request.url);
-  const ipToLookup = url.searchParams.get('ip');
-  if (!ipToLookup) {
-    return new Response(JSON.stringify({ error: 'Missing IP parameter' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  }
-  const { username, apiKey, baseUrl } = config.scamalytics;
-  if (!username || !apiKey) {
-    return new Response(JSON.stringify({ error: 'Scamalytics API credentials not configured.' }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  }
-  const scamalyticsUrl = `${baseUrl}${username}/?key=${apiKey}&ip=${ipToLookup}`;
-  const headers = new Headers({
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-  });
-  try {
-    const scamalyticsResponse = await fetch(scamalyticsUrl);
-    const responseBody = await scamalyticsResponse.json();
-    const dbipResponse = await fetch(`https://api.db-ip.com/v2/free/${ipToLookup}`);
-    const dbip = await dbipResponse.json();
-    return new Response(JSON.stringify({ scamalytics: responseBody, external_datasources: { dbip } }), { headers });
-  } catch (error) {
-    return new Response(JSON.stringify({ error: error.toString() }), { status: 500, headers });
-  }
-}
-
 function getPageCSS() {
+  // This function remains unchanged. The CSS is extensive but correct.
+  // Paste the CSS from the original script here. For brevity, it is omitted.
   return `
       * {
         margin: 0;
         padding: 0;
         box-sizing: border-box;
       }
-      @font-face {
-      font-family: "Aldine 401 BT Web";
-      src: url("https://pub-7a3b428c76aa411181a0f4dd7fa9064b.r2.dev/Aldine401_Mersedeh.woff2") format("woff2");
-      font-weight: 400; font-style: normal; font-display: swap;
-    }
-    @font-face {
-      font-family: "Styrene B LC";
-      src: url("https://pub-7a3b428c76aa411181a0f4dd7fa9064b.r2.dev/StyreneBLC-Regular.woff2") format("woff2");
-      font-weight: 400; font-style: normal; font-display: swap;
-    }
-    @font-face {
-      font-family: "Styrene B LC";
-      src: url("https://pub-7a3b428c76aa411181a0f4dd7fa9064b.r2.dev/StyreneBLC-Medium.woff2") format("woff2");
-      font-weight: 500; font-style: normal; font-display: swap;
-    }
+     @font-face {
+     font-family: "Aldine 401 BT Web";
+     src: url("https://pub-7a3b428c76aa411181a0f4dd7fa9064b.r2.dev/Aldine401_Mersedeh.woff2") format("woff2");
+     font-weight: 400; font-style: normal; font-display: swap;
+   }
+   @font-face {
+     font-family: "Styrene B LC";
+     src: url("https://pub-7a3b428c76aa411181a0f4dd7fa9064b.r2.dev/StyreneBLC-Regular.woff2") format("woff2");
+     font-weight: 400; font-style: normal; font-display: swap;
+   }
+   @font-face {
+     font-family: "Styrene B LC";
+     src: url("https://pub-7a3b428c76aa411181a0f4dd7fa9064b.r2.dev/StyreneBLC-Medium.woff2") format("woff2");
+     font-weight: 500; font-style: normal; font-display: swap;
+   }
       :root {
         --background-primary: #2a2421; --background-secondary: #35302c; --background-tertiary: #413b35;
         --border-color: #5a4f45; --border-color-hover: #766a5f; --text-primary: #e5dfd6; --text-secondary: #b3a89d;
@@ -611,9 +651,9 @@ function getPageCSS() {
         --border-radius: 8px; --transition-speed: 0.2s; --transition-speed-fast: 0.1s; --transition-speed-medium: 0.3s; --transition-speed-long: 0.6s;
         --status-success: #70b570; --status-error: #e05d44; --status-warning: #e0bc44; --status-info: #4f90c4;
         --serif: "Aldine 401 BT Web", "Times New Roman", Times, Georgia, ui-serif, serif;
-      --sans-serif: "Styrene B LC", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, "Noto Color Emoji", sans-serif;
-      --mono-serif: "Fira Code", Cantarell, "Courier Prime", monospace;
-    }
+     --sans-serif: "Styrene B LC", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, "Noto Color Emoji", sans-serif;
+     --mono-serif: "Fira Code", Cantarell, "Courier Prime", monospace;
+   }
       body {
         font-family: var(--sans-serif); font-size: 16px; font-weight: 400; font-style: normal;
         background-color: var(--background-primary); color: var(--text-primary);
@@ -716,84 +756,85 @@ function getPageCSS() {
       .client-btn:hover .client-icon { transform: rotate(15deg) scale(1.1); }
       .client-btn .button-text { position: relative; z-index: 2; transition: letter-spacing 0.3s ease; }
       .client-btn:hover .button-text { letter-spacing: 0.5px; }
-    .client-icon { width: 18px; height: 18px; border-radius: 6px; background-color: var(--background-secondary); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
-    .client-icon svg { width: 14px; height: 14px; fill: var(--accent-secondary); }
-    .button.copied { background-color: var(--accent-secondary) !important; color: var(--background-tertiary) !important; }
-    .button.error { background-color: #c74a3b !important; color: var(--text-accent) !important; }
-    .footer { text-align: center; margin-top: 20px; padding-bottom: 40px; color: var(--text-secondary); font-size: 8px; }
-    .footer p { margin-bottom: 0px; }
-    ::-webkit-scrollbar { width: 8px; height: 8px; }
-    ::-webkit-scrollbar-track { background: var(--background-primary); border-radius: 4px; }
-    ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; border: 2px solid var(--background-primary); }
-    ::-webkit-scrollbar-thumb:hover { background: var(--border-color-hover); }
-    * { scrollbar-width: thin; scrollbar-color: var(--border-color) var(--background-primary); }
-    .ip-info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 24px; }
-    .ip-info-section { background-color: var(--background-tertiary); border-radius: var(--border-radius); padding: 16px; border: 1px solid var(--border-color); display: flex; flex-direction: column; gap: 20px; }
-    .ip-info-header { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border-color); padding-bottom: 10px; }
-    .ip-info-header svg { width: 20px; height: 20px; stroke: var(--accent-secondary); }
-    .ip-info-header h3 { font-family: var(--serif); font-size: 18px; font-weight: 400; color: var(--accent-secondary); margin: 0; }
-    .ip-info-content { display: flex; flex-direction: column; gap: 10px; }
-    .ip-info-item { display: flex; flex-direction: column; gap: 2px; }
-    .ip-info-item .label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; }
-    .ip-info-item .value { font-size: 14px; color: var(--text-primary); word-break: break-all; line-height: 1.4; }
-    .badge { display: inline-flex; align-items: center; justify-content: center; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
-    .badge-yes { background-color: rgba(112, 181, 112, 0.15); color: var(--status-success); border: 1px solid rgba(112, 181, 112, 0.3); }
-    .badge-no { background-color: rgba(224, 93, 68, 0.15); color: var(--status-error); border: 1px solid rgba(224, 93, 68, 0.3); }
-    .badge-neutral { background-color: rgba(79, 144, 196, 0.15); color: var(--status-info); border: 1px solid rgba(79, 144, 196, 0.3); }
-    .badge-warning { background-color: rgba(224, 188, 68, 0.15); color: var(--status-warning); border: 1px solid rgba(224, 188, 68, 0.3); }
-    .skeleton { display: block; background: linear-gradient(90deg, var(--background-tertiary) 25%, var(--background-secondary) 50%, var(--background-tertiary) 75%); background-size: 200% 100%; animation: loading 1.5s infinite; border-radius: 4px; height: 16px; }
-    @keyframes loading { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
-    .country-flag { display: inline-block; width: 18px; height: auto; max-height: 14px; margin-right: 6px; vertical-align: middle; border-radius: 2px; }
-    @media (max-width: 768px) {
-      body { padding: 20px; } .container { padding: 0 14px; width: min(100%, 768px); }
-      .ip-info-grid { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 18px; }
-      .header h1 { font-size: 1.8rem; } .header p { font-size: 0.7rem }
-      .ip-info-section { padding: 14px; gap: 18px; } .ip-info-header h3 { font-size: 16px; }
-      .ip-info-header { gap: 8px; } .ip-info-content { gap: 8px; }
-      .ip-info-item .label { font-size: 11px; } .ip-info-item .value { font-size: 13px; }
-      .config-card { padding: 16px; } .config-title { font-size: 18px; }
-      .config-title .refresh-btn { font-size: 11px; } .config-content pre { font-size: 12px; }
-      .client-buttons { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
-      .button { font-size: 12px; } .copy-buttons { font-size: 11px; }
-    }
-    @media (max-width: 480px) {
-      body { padding: 16px; } .container { padding: 0 12px; width: min(100%, 390px); }
-      .header h1 { font-size: 20px; } .header p { font-size: 8px; }
-      .ip-info-section { padding: 14px; gap: 16px; }
-      .ip-info-grid { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
-      .ip-info-header h3 { font-size: 14px; } .ip-info-header { gap: 6px; } .ip-info-content { gap: 6px; }
-      .ip-info-item .label { font-size: 9px; } .ip-info-item .value { font-size: 11px; }
-      .badge { padding: 2px 6px; font-size: 10px; border-radius: 10px; }
-      .config-card { padding: 10px; } .config-title { font-size: 16px; }
-      .config-title .refresh-btn { font-size: 10px; } .config-content { padding: 12px; }
-      .config-content pre { font-size: 10px; }
-      .client-buttons { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
-      .button { padding: 4px 8px; font-size: 11px; } .copy-buttons { font-size: 10px; }
-      .footer { font-size: 10px; }
-    }
-    @media (max-width: 359px) {
-          body { padding: 12px; font-size: 14px; } .container { max-width: 100%; padding: 8px; }
-          .header h1 { font-size: 16px; } .header p { font-size: 6px; }
-          .ip-info-section { padding: 12px; gap: 12px; }
-          .ip-info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
-          .ip-info-header h3 { font-size: 13px; } .ip-info-header { gap: 4px; } .ip-info-content { gap: 4px; }
-          .ip-info-header svg { width: 16px; height: 16px; } .ip-info-item .label { font-size: 8px; }
-  .ip-info-item .value { font-size: 10px; } .badge { padding: 1px 4px; font-size: 9px; border-radius: 8px; }
-          .config-card { padding: 8px; } .config-title { font-size: 13px; } .config-title .refresh-btn { font-size: 9px; }
-          .config-content { padding: 8px; } .config-content pre { font-size: 8px; }
-  .client-buttons { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
-          .button { padding: 3px 6px; font-size: 10px; } .copy-buttons { font-size: 9px; } .footer { font-size: 7px; }
-        }
+   .client-icon { width: 18px; height: 18px; border-radius: 6px; background-color: var(--background-secondary); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+   .client-icon svg { width: 14px; height: 14px; fill: var(--accent-secondary); }
+   .button.copied { background-color: var(--accent-secondary) !important; color: var(--background-tertiary) !important; }
+   .button.error { background-color: #c74a3b !important; color: var(--text-accent) !important; }
+   .footer { text-align: center; margin-top: 20px; padding-bottom: 40px; color: var(--text-secondary); font-size: 8px; }
+   .footer p { margin-bottom: 0px; }
+   ::-webkit-scrollbar { width: 8px; height: 8px; }
+   ::-webkit-scrollbar-track { background: var(--background-primary); border-radius: 4px; }
+   ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; border: 2px solid var(--background-primary); }
+   ::-webkit-scrollbar-thumb:hover { background: var(--border-color-hover); }
+   * { scrollbar-width: thin; scrollbar-color: var(--border-color) var(--background-primary); }
+   .ip-info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 24px; }
+   .ip-info-section { background-color: var(--background-tertiary); border-radius: var(--border-radius); padding: 16px; border: 1px solid var(--border-color); display: flex; flex-direction: column; gap: 20px; }
+   .ip-info-header { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border-color); padding-bottom: 10px; }
+   .ip-info-header svg { width: 20px; height: 20px; stroke: var(--accent-secondary); }
+   .ip-info-header h3 { font-family: var(--serif); font-size: 18px; font-weight: 400; color: var(--accent-secondary); margin: 0; }
+   .ip-info-content { display: flex; flex-direction: column; gap: 10px; }
+   .ip-info-item { display: flex; flex-direction: column; gap: 2px; }
+   .ip-info-item .label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; }
+   .ip-info-item .value { font-size: 14px; color: var(--text-primary); word-break: break-all; line-height: 1.4; }
+   .badge { display: inline-flex; align-items: center; justify-content: center; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
+   .badge-yes { background-color: rgba(112, 181, 112, 0.15); color: var(--status-success); border: 1px solid rgba(112, 181, 112, 0.3); }
+   .badge-no { background-color: rgba(224, 93, 68, 0.15); color: var(--status-error); border: 1px solid rgba(224, 93, 68, 0.3); }
+   .badge-neutral { background-color: rgba(79, 144, 196, 0.15); color: var(--status-info); border: 1px solid rgba(79, 144, 196, 0.3); }
+   .badge-warning { background-color: rgba(224, 188, 68, 0.15); color: var(--status-warning); border: 1px solid rgba(224, 188, 68, 0.3); }
+   .skeleton { display: block; background: linear-gradient(90deg, var(--background-tertiary) 25%, var(--background-secondary) 50%, var(--background-tertiary) 75%); background-size: 200% 100%; animation: loading 1.5s infinite; border-radius: 4px; height: 16px; }
+   @keyframes loading { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+   .country-flag { display: inline-block; width: 18px; height: auto; max-height: 14px; margin-right: 6px; vertical-align: middle; border-radius: 2px; }
+   @media (max-width: 768px) {
+     body { padding: 20px; } .container { padding: 0 14px; width: min(100%, 768px); }
+     .ip-info-grid { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 18px; }
+     .header h1 { font-size: 1.8rem; } .header p { font-size: 0.7rem }
+     .ip-info-section { padding: 14px; gap: 18px; } .ip-info-header h3 { font-size: 16px; }
+     .ip-info-header { gap: 8px; } .ip-info-content { gap: 8px; }
+     .ip-info-item .label { font-size: 11px; } .ip-info-item .value { font-size: 13px; }
+     .config-card { padding: 16px; } .config-title { font-size: 18px; }
+     .config-title .refresh-btn { font-size: 11px; } .config-content pre { font-size: 12px; }
+     .client-buttons { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+     .button { font-size: 12px; } .copy-buttons { font-size: 11px; }
+   }
+   @media (max-width: 480px) {
+     body { padding: 16px; } .container { padding: 0 12px; width: min(100%, 390px); }
+     .header h1 { font-size: 20px; } .header p { font-size: 8px; }
+     .ip-info-section { padding: 14px; gap: 16px; }
+     .ip-info-grid { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
+     .ip-info-header h3 { font-size: 14px; } .ip-info-header { gap: 6px; } .ip-info-content { gap: 6px; }
+     .ip-info-item .label { font-size: 9px; } .ip-info-item .value { font-size: 11px; }
+     .badge { padding: 2px 6px; font-size: 10px; border-radius: 10px; }
+     .config-card { padding: 10px; } .config-title { font-size: 16px; }
+     .config-title .refresh-btn { font-size: 10px; } .config-content { padding: 12px; }
+     .config-content pre { font-size: 10px; }
+     .client-buttons { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+     .button { padding: 4px 8px; font-size: 11px; } .copy-buttons { font-size: 10px; }
+     .footer { font-size: 10px; }
+   }
+   @media (max-width: 359px) {
+         body { padding: 12px; font-size: 14px; } .container { max-width: 100%; padding: 8px; }
+         .header h1 { font-size: 16px; } .header p { font-size: 6px; }
+         .ip-info-section { padding: 12px; gap: 12px; }
+         .ip-info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+         .ip-info-header h3 { font-size: 13px; } .ip-info-header { gap: 4px; } .ip-info-content { gap: 4px; }
+         .ip-info-header svg { width: 16px; height: 16px; } .ip-info-item .label { font-size: 8px; }
+ .ip-info-item .value { font-size: 10px; } .badge { padding: 1px 4px; font-size: 9px; border-radius: 8px; }
+         .config-card { padding: 8px; } .config-title { font-size: 13px; } .config-title .refresh-btn { font-size: 9px; }
+         .config-content { padding: 8px; } .config-content pre { font-size: 8px; }
+ .client-buttons { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+         .button { padding: 3px 6px; font-size: 10px; } .copy-buttons { font-size: 9px; } .footer { font-size: 7px; }
+       }
      
-        @media (min-width: 360px) { .container { max-width: 95%; } }
-        @media (min-width: 480px) { .container { max-width: 90%; } }
-        @media (min-width: 640px) { .container { max-width: 600px; } }
-        @media (min-width: 768px) { .container { max-width: 720px; } }
-        @media (min-width: 1024px) { .container { max-width: 800px; } }
+       @media (min-width: 360px) { .container { max-width: 95%; } }
+       @media (min-width: 480px) { .container { max-width: 90%; } }
+       @media (min-width: 640px) { .container { max-width: 600px; } }
+       @media (min-width: 768px) { .container { max-width: 720px; } }
+       @media (min-width: 1024px) { .container { max-width: 800px; } }
   `;
 }
 
 function getPageHTML(configs, clientUrls) {
+  // HTML remains the same as it correctly uses placeholders (skeletons)
   return `
     <div class="container">
       <div class="header">
@@ -894,12 +935,14 @@ function getPageHTML(configs, clientUrls) {
   `;
 }
 
+// --- MODIFIED CLIENT-SIDE SCRIPT ---
+// This is now much simpler, faster, and more reliable.
 function getPageScript() {
   return `
       function copyToClipboard(button, text) {
         const originalHTML = button.innerHTML;
         navigator.clipboard.writeText(text).then(() => {
-          button.innerHTML = \`<svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg> Copied!\`;
+          button.innerHTML = \`<svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg> Copied!\`;
           button.classList.add("copied");
           button.disabled = true;
           setTimeout(() => {
@@ -912,165 +955,50 @@ function getPageScript() {
         });
       }
 
-      async function fetchClientPublicIP() {
-        try {
-          const response = await fetch('https://api.ipify.org?format=json');
-          if (!response.ok) throw new Error(\`HTTP error! status: \${response.status}\`);
-          return (await response.json()).ip;
-        } catch (error) {
-          console.error('Error fetching client IP:', error);
-          return null;
-        }
-      }
+      function updateDisplay(data) {
+        // Update Proxy Info
+        const proxy = data.proxy || {};
+        document.getElementById('proxy-host').textContent = proxy.host || 'N/A';
+        document.getElementById('proxy-ip').textContent = proxy.ip || 'N/A';
+        document.getElementById('proxy-isp').textContent = proxy.isp || 'N/A';
+        const p_loc = [proxy.city, proxy.country].filter(Boolean).join(', ');
+        const p_flag = proxy.country ? \`<img src="https://flagcdn.com/w20/\${proxy.country.toLowerCase()}.png" class="country-flag" alt="\${proxy.country}"> \` : '';
+        document.getElementById('proxy-location').innerHTML = (p_loc) ? \`\${p_flag}\${p_loc}\` : 'N/A';
 
-      async function fetchScamalyticsClientInfo(clientIp) {
-        if (!clientIp) return null;
-        try {
-          const response = await fetch(\`/scamalytics-lookup?ip=\${encodeURIComponent(clientIp)}\`);
-          if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(\`Worker request failed! status: \${response.status}, details: \${errorText}\`);
-          }
-          const data = await response.json();
-          if (data.scamalytics && data.scamalytics.status === 'error') {
-              throw new Error(data.scamalytics.error || 'Scamalytics API error via Worker');
-          }
-          return data;
-        } catch (error) {
-          console.error('Error fetching from Scamalytics via Worker:', error);
-          return null;
-        }
-      }
-
-      function updateScamalyticsClientDisplay(data) {
-        const prefix = 'client';
-        if (!data || !data.scamalytics || data.scamalytics.status !== 'ok') {
-          showError(prefix, (data && data.scamalytics && data.scamalytics.error) || 'Could not load client data from Scamalytics');
-          return;
-        }
-        const sa = data.scamalytics;
-        const dbip = data.external_datasources?.dbip;
-        const elements = {
-          ip: document.getElementById(\`\${prefix}-ip\`), location: document.getElementById(\`\${prefix}-location\`),
-          isp: document.getElementById(\`\${prefix}-isp\`), proxy: document.getElementById(\`\${prefix}-proxy\`)
-        };
-        if (elements.ip) elements.ip.textContent = sa.ip || "N/A";
-        if (elements.location) {
-          const city = dbip?.city || '';
-          const countryName = dbip?.countryName || '';
-          const countryCode = dbip?.countryCode ? dbip.countryCode.toLowerCase() : '';
-          let locationString = 'N/A';
-          let flagElementHtml = countryCode ? \`<img src="https://flagcdn.com/w20/\${countryCode}.png" srcset="https://flagcdn.com/w40/\${countryCode}.png 2x" alt="\${dbip.countryCode}" class="country-flag"> \` : '';
-          let textPart = [city, countryName].filter(Boolean).join(', ');
-          if (flagElementHtml || textPart) locationString = \`\${flagElementHtml}\${textPart}\`.trim();
-          elements.location.innerHTML = locationString || "N/A";
-        }
-        if (elements.isp) elements.isp.textContent = sa.isp || dbip?.isp || "N/A";
-        if (elements.proxy) {
-          const score = sa.score;
-          const risk = sa.risk;
-          let riskText = "Unknown";
-          let badgeClass = "badge-neutral";
-          if (risk && score !== undefined) {
-              riskText = \`\${score} - \${risk.charAt(0).toUpperCase() + risk.slice(1)}\`;
-              switch (risk.toLowerCase()) {
-                 case "low": badgeClass = "badge-yes"; break;
-                 case "medium": badgeClass = "badge-warning"; break;
-                 case "high": case "very high": badgeClass = "badge-no"; break;
-              }
-          }
-          elements.proxy.innerHTML = \`<span class="badge \${badgeClass}">\${riskText}</span>\`;
-        }
-      }
-
-      function updateIpApiIoDisplay(geo, prefix, originalHost) {
-        const hostElement = document.getElementById(\`\${prefix}-host\`);
-        if (hostElement) hostElement.textContent = originalHost || "N/A";
-        const elements = {
-          ip: document.getElementById(\`\${prefix}-ip\`), location: document.getElementById(\`\${prefix}-location\`),
-          isp: document.getElementById(\`\${prefix}-isp\`)
-        };
-        if (!geo) {
-          Object.values(elements).forEach(el => { if(el) el.innerHTML = "N/A"; });
-          return;
-        }
-        if (elements.ip) elements.ip.textContent = geo.ip || "N/A";
-        if (elements.location) {
-          const city = geo.city || '';
-          const countryName = geo.country_name || '';
-          const countryCode = geo.country_code ? geo.country_code.toLowerCase() : '';
-          let flagElementHtml = countryCode ? \`<img src="https://flagcdn.com/w20/\${countryCode}.png" srcset="https://flagcdn.com/w40/\${countryCode}.png 2x" alt="\${geo.country_code}" class="country-flag"> \` : '';
-          let textPart = [city, countryName].filter(Boolean).join(', ');
-          elements.location.innerHTML = (flagElementHtml || textPart) ? \`\${flagElementHtml}\${textPart}\`.trim() : "N/A";
-        }
-        if (elements.isp) elements.isp.textContent = geo.isp || geo.org || geo.asn_name || geo.asn || 'N/A';
-      }
-
-      async function fetchIpApiIoInfo(ip) {
-        try {
-          const response = await fetch(\`https://ip-api.io/json/\${ip}\`);
-          if (!response.ok) throw new Error(\`HTTP error! status: \${response.status}\`);
-          return await response.json();
-        } catch (error) {
-          console.error('IP API Error (ip-api.io):', error);
-          return null;
-        }
-      }
-
-      function showError(prefix, message = "Could not load data", originalHostForProxy = null) {
-        const errorMessage = "N/A";
-        const elements = (prefix === 'proxy') 
-          ? ['host', 'ip', 'location', 'isp']
-          : ['ip', 'location', 'isp', 'proxy'];
+        // Update Client Info
+        const client = data.client || {};
+        document.getElementById('client-ip').textContent = client.ip || 'N/A';
+        document.getElementById('client-isp').textContent = client.isp || 'N/A';
+        const c_loc = [client.city, client.country].filter(Boolean).join(', ');
+        const c_flag = client.country ? \`<img src="https://flagcdn.com/w20/\${client.country.toLowerCase()}.png" class="country-flag" alt="\${client.country}"> \` : '';
+        document.getElementById('client-location').innerHTML = (c_loc) ? \`\${c_flag}\${c_loc}\` : 'N/A';
         
-        elements.forEach(key => {
-          const el = document.getElementById(\`\${prefix}-\${key}\`);
-          if (!el) return;
-          if (key === 'host' && prefix === 'proxy') el.textContent = originalHostForProxy || errorMessage;
-          else if (key === 'proxy' && prefix === 'client') el.innerHTML = \`<span class="badge badge-neutral">N/A</span>\`;
-          else el.innerHTML = errorMessage;
-        });
-        console.warn(\`\${prefix} data loading failed: \${message}\`);
+        // Update Risk Score Badge
+        const risk = client.risk;
+        let riskText = "Unknown";
+        let badgeClass = "badge-neutral";
+        if (risk && risk.score !== undefined) {
+            riskText = \`\${risk.score} - \${risk.risk.charAt(0).toUpperCase() + risk.risk.slice(1)}\`;
+            switch (risk.risk.toLowerCase()) {
+                case "low": badgeClass = "badge-yes"; break;
+                case "medium": badgeClass = "badge-warning"; break;
+                case "high": case "very high": badgeClass = "badge-no"; break;
+            }
+        }
+        document.getElementById('client-proxy').innerHTML = \`<span class="badge \${badgeClass}">\${riskText}</span>\`;
       }
 
       async function loadNetworkInfo() {
         try {
-          const proxyIpWithPort = document.body.getAttribute('data-proxy-ip') || "N/A";
-          const proxyDomainOrIp = proxyIpWithPort.split(':')[0];
-          const proxyHostEl = document.getElementById('proxy-host');
-          if(proxyHostEl) proxyHostEl.textContent = proxyIpWithPort;
-
-          if (proxyDomainOrIp && proxyDomainOrIp !== "N/A") {
-            let resolvedProxyIp = proxyDomainOrIp;
-            if (!/^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$/.test(proxyDomainOrIp)) {
-              try {
-                const dnsRes = await fetch(\`https://dns.google/resolve?name=\${encodeURIComponent(proxyDomainOrIp)}&type=A\`);
-                if (dnsRes.ok) {
-                    const dnsData = await dnsRes.json();
-                    const ipAnswer = dnsData.Answer?.find(a => a.type === 1);
-                    if (ipAnswer) resolvedProxyIp = ipAnswer.data;
-                }
-              } catch (e) { console.error('DNS resolution for proxy failed:', e); }
-            }
-            const proxyGeoData = await fetchIpApiIoInfo(resolvedProxyIp);
-            updateIpApiIoDisplay(proxyGeoData, 'proxy', proxyIpWithPort);
-          } else {
-            showError('proxy', 'Proxy Host not available', proxyIpWithPort);
-          }
-
-          const clientIp = await fetchClientPublicIP();
-          if (clientIp) {
-            const clientIpElement = document.getElementById('client-ip');
-            if(clientIpElement) clientIpElement.textContent = clientIp;
-            const scamalyticsData = await fetchScamalyticsClientInfo(clientIp);
-            updateScamalyticsClientDisplay(scamalyticsData);
-          } else {
-            showError('client', 'Could not determine your IP address.');
-          }
+            const response = await fetch('/api/network-info');
+            if (!response.ok) throw new Error(\`API request failed with status \${response.status}\`);
+            const data = await response.json();
+            updateDisplay(data);
         } catch (error) {
-          console.error('Overall network info loading failed:', error);
-          showError('proxy', \`Error: \${error.message}\`, document.body.getAttribute('data-proxy-ip') || "N/A");
-          showError('client', \`Error: \${error.message}\`);
+            console.error('Failed to load network info:', error);
+            // In case of error, show N/A everywhere
+            const errorData = { client: {}, proxy: { host: document.body.getAttribute('data-proxy-ip') } };
+            updateDisplay(errorData);
         }
       }
 
@@ -1094,15 +1022,14 @@ function getPageScript() {
         resetToSkeleton('client');
         loadNetworkInfo().finally(() => setTimeout(() => {
           button.disabled = false; if (icon) icon.style.animation = '';
-        }, 1000));
+        }, 500));
       });
 
       const style = document.createElement('style');
       style.textContent = \`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }\`;
       document.head.appendChild(style);
 
-      document.addEventListener('DOMContentLoaded', () => {
-        loadNetworkInfo();
-      });
+      document.addEventListener('DOMContentLoaded', loadNetworkInfo);
   `;
 }
+
