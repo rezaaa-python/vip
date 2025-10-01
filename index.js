@@ -2,8 +2,8 @@
 // -----------------------------------------------------
 // 🚀 VLESS Proxy Worker - Enhanced & Optimized Script 🚀
 // -----------------------------------------------------
-// This script features a fully client-side rendered network 
-// information panel for maximum accuracy, speed, and reliability.
+// This script includes an intelligent, server-side rendered
+// network information panel for maximum speed and reliability.
 //
 
 import { connect } from 'cloudflare:sockets';
@@ -48,6 +48,11 @@ export default {
       const url = new URL(request.url);
       const cfg = Config.fromEnv(env);
 
+      // --- SMART API ENDPOINT FOR NETWORK INFO ---
+      if (url.pathname === '/api/network-info') {
+        return handleNetworkInfo(request, cfg);
+      }
+
       // --- HTTP routes for Admin Panel, Subscriptions, etc. ---
       if (!env.DB || !env.KV) return new Response('Service Unavailable: D1 or KV binding is not configured.', { status: 503 });
       if (!env.ADMIN_KEY) console.error('CRITICAL: ADMIN_KEY secret is not set in environment variables.');
@@ -64,7 +69,7 @@ export default {
       }
       
       if (userID && await isValidUser(userID, env, ctx)) {
-        return handleConfigPage(userID, url.hostname, cfg);
+        return handleConfigPage(userID, url.hostname, cfg.proxyAddress);
       }
       
       return new Response('404 Not Found. Please use your unique user ID in the URL.', { status: 404 });
@@ -74,6 +79,73 @@ export default {
     }
   },
 };
+
+// --- NEW SMART API ENDPOINT FOR NETWORK INFO ---
+async function handleNetworkInfo(request, config) {
+    const clientIp = request.headers.get('CF-Connecting-IP');
+    const proxyHost = config.proxyIP;
+
+    // Helper to fetch IP details from a reliable provider
+    const getIpDetails = async (ip) => {
+        if (!ip) return null;
+        try {
+            // Using a reliable and free IP geolocation service
+            const response = await fetch(`https://ipinfo.io/${ip}/json`);
+            if (!response.ok) throw new Error(`ipinfo.io status: ${response.status}`);
+            const data = await response.json();
+            return {
+                ip: data.ip,
+                city: data.city,
+                country: data.country, // ipinfo provides country code
+                isp: data.org,
+            };
+        } catch (error) {
+            console.error(`Failed to fetch details for IP ${ip}:`, error);
+            return { ip }; // Return at least the IP on failure
+        }
+    };
+
+    // Helper to get Scamalytics data for risk assessment
+    const getScamalyticsDetails = async (ip) => {
+        if (!ip || !config.scamalytics.apiKey || !config.scamalytics.username) return null;
+        try {
+            const url = `${config.scamalytics.baseUrl}${config.scamalytics.username}/?key=${config.scamalytics.apiKey}&ip=${ip}`;
+            const response = await fetch(url);
+            if (!response.ok) throw new Error(`Scamalytics status: ${response.status}`);
+            const data = await response.json();
+            return (data.status === 'ok') ? { score: data.score, risk: data.risk } : null;
+        } catch (error) {
+            console.error(`Failed to fetch Scamalytics for IP ${ip}:`, error);
+            return null;
+        }
+    };
+    
+    // Fetch all data in parallel for maximum speed
+    const [clientDetails, proxyDetails, scamalyticsData] = await Promise.all([
+        getIpDetails(clientIp),
+        getIpDetails(proxyHost),
+        getScamalyticsDetails(clientIp)
+    ]);
+    
+    const responseData = {
+        client: {
+            ...clientDetails,
+            risk: scamalyticsData,
+        },
+        proxy: {
+            host: config.proxyAddress,
+            ...proxyDetails
+        }
+    };
+    
+    return new Response(JSON.stringify(responseData), {
+        headers: { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*' // Allow cross-origin requests if needed
+        },
+    });
+}
+
 
 // --- WEBSOCKET & PROXY LOGIC ---
 async function handleWebSocket(request, env, ctx) {
@@ -453,12 +525,12 @@ async function handleAdminRoutes(request, env) {
 }
 
 // --- HTML PAGE GENERATION ---
-function handleConfigPage(userID, hostName, config) {
-  const html = generateBeautifulConfigPage(userID, hostName, config);
+function handleConfigPage(userID, hostName, proxyAddress) {
+  const html = generateBeautifulConfigPage(userID, hostName, proxyAddress);
   return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
-function generateBeautifulConfigPage(userID, hostName, config) {
+function generateBeautifulConfigPage(userID, hostName, proxyAddress) {
   const dream = buildLink({
     core: 'xray', proto: 'tls', userID, hostName,
     address: hostName, port: 443, tag: `${hostName}-Xray`,
@@ -480,7 +552,7 @@ function generateBeautifulConfigPage(userID, hostName, config) {
     exclave: `sn://subscription?url=${encodeURIComponent(subSbUrl)}`,
   };
 
-  return `
+  let finalHTML = `
   <!doctype html>
   <html lang="en">
   <head>
@@ -493,17 +565,13 @@ function generateBeautifulConfigPage(userID, hostName, config) {
     <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@300..700&display=swap" rel="stylesheet">
     <style>${getPageCSS()}</style> 
   </head>
-  <body 
-    data-proxy-ip="${config.proxyIP}"
-    data-proxy-address="${config.proxyAddress}"
-    data-scamalytics-user="${config.scamalytics.username}"
-    data-scamalytics-apikey="${config.scamalytics.apiKey}"
-    data-scamalytics-baseurl="${config.scamalytics.baseUrl}"
-  >
+  <body data-proxy-ip="${proxyAddress}">
     ${getPageHTML(configs, clientUrls)}
     <script>${getPageScript()}</script>
   </body>
   </html>`;
+
+  return finalHTML;
 }
 
 function getAdminLoginHTML() {
@@ -868,148 +936,100 @@ function getPageHTML(configs, clientUrls) {
   `;
 }
 
-// --- NEW, FULLY CLIENT-SIDE SCRIPT ---
+// --- MODIFIED CLIENT-SIDE SCRIPT ---
+// This script is now much simpler, faster, and more reliable.
 function getPageScript() {
   return `
-    function copyToClipboard(button, text) {
+      function copyToClipboard(button, text) {
         const originalHTML = button.innerHTML;
         navigator.clipboard.writeText(text).then(() => {
-            button.innerHTML = \`<svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg> Copied!\`;
-            button.classList.add("copied");
-            button.disabled = true;
-            setTimeout(() => {
-                button.innerHTML = originalHTML;
-                button.classList.remove("copied");
-                button.disabled = false;
-            }, 1200);
+          button.innerHTML = \`<svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg> Copied!\`;
+          button.classList.add("copied");
+          button.disabled = true;
+          setTimeout(() => {
+            button.innerHTML = originalHTML;
+            button.classList.remove("copied");
+            button.disabled = false;
+          }, 1200);
         }).catch(err => {
-            console.error("Failed to copy text: ", err);
+          console.error("Failed to copy text: ", err);
         });
-    }
+      }
 
-    // Helper to fetch IP details from a reliable provider
-    async function getIpDetails(ip) {
-        try {
-            const url = ip ? \`https://ipinfo.io/\${ip}/json\` : 'https://ipinfo.io/json';
-            const response = await fetch(url);
-            if (!response.ok) throw new Error(\`ipinfo.io status: \${response.status}\`);
-            const data = await response.json();
-            return {
-                ip: data.ip,
-                city: data.city,
-                country: data.country,
-                isp: data.org,
-            };
-        } catch (error) {
-            console.error(\`Failed to fetch details for IP \${ip || 'client'}:\`, error);
-            return { ip: ip || 'Error' }; // Return at least the IP on failure
-        }
-    }
+      function updateDisplay(data) {
+        // Update Proxy Info
+        const proxy = data.proxy || {};
+        document.getElementById('proxy-host').textContent = proxy.host || 'N/A';
+        document.getElementById('proxy-ip').textContent = proxy.ip || 'N/A';
+        document.getElementById('proxy-isp').textContent = proxy.isp || 'N/A';
+        const p_loc = [proxy.city, proxy.country].filter(Boolean).join(', ');
+        const p_flag = proxy.country ? \`<img src="https://flagcdn.com/w20/\${proxy.country.toLowerCase()}.png" class="country-flag" alt="\${proxy.country}"> \` : '';
+        document.getElementById('proxy-location').innerHTML = (p_loc) ? \`\${p_flag}\${p_loc}\` : 'N/A';
 
-    // Helper to get Scamalytics data for risk assessment
-    async function getScamalyticsDetails(ip, config) {
-        if (!ip || !config.apiKey || !config.username) return null;
-        try {
-            const url = \`\${config.baseUrl}\${config.username}/?key=\${config.apiKey}&ip=\${ip}\`;
-            const response = await fetch(url);
-            if (!response.ok) throw new Error(\`Scamalytics status: \${response.status}\`);
-            const data = await response.json();
-            return (data.status === 'ok') ? { score: data.score, risk: data.risk } : null;
-        } catch (error) {
-            console.error(\`Failed to fetch Scamalytics for IP \${ip}:\`, error);
-            return null;
-        }
-    }
-
-    function updateIpInfo(elementId, details) {
-        const ipElem = document.getElementById(\`\${elementId}-ip\`);
-        const ispElem = document.getElementById(\`\${elementId}-isp\`);
-        const locElem = document.getElementById(\`\${elementId}-location\`);
+        // Update Client Info
+        const client = data.client || {};
+        document.getElementById('client-ip').textContent = client.ip || 'N/A';
+        document.getElementById('client-isp').textContent = client.isp || 'N/A';
+        const c_loc = [client.city, client.country].filter(Boolean).join(', ');
+        const c_flag = client.country ? \`<img src="https://flagcdn.com/w20/\${client.country.toLowerCase()}.png" class="country-flag" alt="\${client.country}"> \` : '';
+        document.getElementById('client-location').innerHTML = (c_loc) ? \`\${c_flag}\${c_loc}\` : 'N/A';
         
-        if (ipElem) ipElem.textContent = details.ip || 'N/A';
-        if (ispElem) ispElem.textContent = details.isp || 'N/A';
-        if (locElem) {
-            const loc = [details.city, details.country].filter(Boolean).join(', ');
-            const flag = details.country ? \`<img src="https://flagcdn.com/w20/\${details.country.toLowerCase()}.png" class="country-flag" alt="\${details.country}"> \` : '';
-            locElem.innerHTML = (loc) ? \`\${flag}\${loc}\` : 'N/A';
-        }
-    }
-
-    function updateRiskScore(riskData) {
-        const riskElem = document.getElementById('client-proxy');
-        if (!riskElem) return;
-
+        // Update Risk Score Badge
+        const risk = client.risk;
         let riskText = "Unknown";
         let badgeClass = "badge-neutral";
-        if (riskData && riskData.score !== undefined) {
-            riskText = \`\${riskData.score} - \${riskData.risk.charAt(0).toUpperCase() + riskData.risk.slice(1)}\`;
-            switch (riskData.risk.toLowerCase()) {
+        if (risk && risk.score !== undefined) {
+            riskText = \`\${risk.score} - \${risk.risk.charAt(0).toUpperCase() + risk.risk.slice(1)}\`;
+            switch (risk.risk.toLowerCase()) {
                 case "low": badgeClass = "badge-yes"; break;
                 case "medium": badgeClass = "badge-warning"; break;
                 case "high": case "very high": badgeClass = "badge-no"; break;
             }
         }
-        riskElem.innerHTML = \`<span class="badge \${badgeClass}">\${riskText}</span>\`;
-    }
+        document.getElementById('client-proxy').innerHTML = \`<span class="badge \${badgeClass}">\${riskText}</span>\`;
+      }
 
-    async function loadNetworkInfo() {
-        const { proxyIp, proxyAddress, scamalyticsUser, scamalyticsApikey, scamalyticsBaseurl } = document.body.dataset;
-        
-        document.getElementById('proxy-host').textContent = proxyAddress || 'N/A';
-
-        const scamalyticsConfig = {
-            username: scamalyticsUser,
-            apiKey: scamalyticsApikey,
-            baseUrl: scamalyticsBaseurl,
-        };
-
-        // Fetch proxy and client IP details in parallel
-        const [proxyDetails, clientDetails] = await Promise.all([
-            getIpDetails(proxyIp),
-            getIpDetails() // No IP means "get my own IP"
-        ]);
-
-        updateIpInfo('proxy', proxyDetails);
-        updateIpInfo('client', clientDetails);
-
-        // Once we have the client IP, fetch its risk score
-        if (clientDetails && clientDetails.ip) {
-            getScamalyticsDetails(clientDetails.ip, scamalyticsConfig).then(updateRiskScore);
-        } else {
-            updateRiskScore(null);
+      async function loadNetworkInfo() {
+        try {
+            const response = await fetch('/api/network-info');
+            if (!response.ok) throw new Error(\`API request failed with status \${response.status}\`);
+            const data = await response.json();
+            updateDisplay(data);
+        } catch (error) {
+            console.error('Failed to load network info:', error);
+            // In case of error, show N/A everywhere
+            const errorData = { client: {}, proxy: { host: document.body.getAttribute('data-proxy-ip') } };
+            updateDisplay(errorData);
         }
-    }
+      }
 
-    document.getElementById('refresh-ip-info')?.addEventListener('click', function() {
+      document.getElementById('refresh-ip-info')?.addEventListener('click', function() {
         const button = this;
         const icon = button.querySelector('.refresh-icon');
         button.disabled = true;
         if (icon) icon.style.animation = 'spin 1s linear infinite';
 
-        // Reset all values to skeletons
-        const elementsToReset = [
-            'proxy-ip', 'proxy-location', 'proxy-isp', 'proxy-host',
-            'client-ip', 'client-location', 'client-isp', 'client-proxy'
-        ];
-        elementsToReset.forEach(id => {
-            const element = document.getElementById(id);
+        const resetToSkeleton = (prefix) => {
+          const elementsToReset = ['ip', 'location', 'isp'];
+          if (prefix === 'proxy') elementsToReset.push('host');
+          if (prefix === 'client') elementsToReset.push('proxy');
+          elementsToReset.forEach(key => {
+            const element = document.getElementById(\`\${prefix}-\${key}\`);
             if (element) element.innerHTML = \`<span class="skeleton" style="width: 120px;"></span>\`;
-        });
-        
-        loadNetworkInfo().finally(() => {
-            setTimeout(() => {
-                button.disabled = false;
-                if (icon) icon.style.animation = '';
-            }, 500);
-        });
-    });
+          });
+        };
 
-    // Add spin animation style to head
-    const style = document.createElement('style');
-    style.textContent = \`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }\`;
-    document.head.appendChild(style);
+        resetToSkeleton('proxy');
+        resetToSkeleton('client');
+        loadNetworkInfo().finally(() => setTimeout(() => {
+          button.disabled = false; if (icon) icon.style.animation = '';
+        }, 500));
+      });
 
-    // Load info on page load
-    document.addEventListener('DOMContentLoaded', loadNetworkInfo);
+      const style = document.createElement('style');
+      style.textContent = \`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }\`;
+      document.head.appendChild(style);
+
+      document.addEventListener('DOMContentLoaded', loadNetworkInfo);
   `;
 }
