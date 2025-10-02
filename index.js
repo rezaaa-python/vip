@@ -1,29 +1,40 @@
-//
 // -----------------------------------------------------
 // 🚀 VLESS Proxy Worker - Enhanced & Optimized Script 🚀
 // -----------------------------------------------------
 // This script includes an intelligent, server-side rendered
-// network information panel for maximum speed and reliability.
+// network information panel and a DNS-over-HTTPS (DoH) proxy
+// for maximum speed, security, and reliability.
 //
 
 import { connect } from 'cloudflare:sockets';
 
 // --- CONFIGURATION ---
+// All settings are now managed via Environment Variables in the Cloudflare dashboard.
 const Config = {
-  // Fallback/Relay server if PROXYIP environment variable is not set
-  proxyIPs: ['nima.nscl.ir:443'],
+  // Fallback/Relay server if PROXYIP is not set
+  defaultProxyIPs: ['nima.nscl.ir:443'],
+
+  // Default upstream DoH server if DOH_UPSTREAM_URL is not set
+  defaultDoHUpstream: 'https://chrome.cloudflare-dns.com/dns-query',
+
+  // Scamalytics API default settings
   scamalytics: {
     username: 'revilseptember',
     apiKey: 'b2fc368184deb3d8ac914bd776b8215fe899dd8fef69fbaba77511acfbdeca0d',
     baseUrl: 'https://api12.scamalytics.com/v3/',
   },
+
+  // This function reads settings from the environment variables (env)
   fromEnv(env) {
-    const selectedProxyIP = env.PROXYIP || this.proxyIPs[Math.floor(Math.random() * this.proxyIPs.length)];
+    const proxyIPs = env.PROXYIP ? env.PROXYIP.split(',').map(ip => ip.trim()) : this.defaultProxyIPs;
+    const selectedProxyIP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
     const [proxyHost, proxyPort = '443'] = selectedProxyIP.split(':');
+
     return {
       proxyAddress: selectedProxyIP,
       proxyIP: proxyHost,
       proxyPort: parseInt(proxyPort, 10),
+      dohUpstreamUrl: env.DOH_UPSTREAM_URL || this.defaultDoHUpstream,
       scamalytics: {
         username: env.SCAMALYTICS_USERNAME || this.scamalytics.username,
         apiKey: env.SCAMALYTICS_API_KEY || this.scamalytics.apiKey,
@@ -42,23 +53,30 @@ const CONST = {
 export default {
   async fetch(request, env, ctx) {
     try {
-      if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
-        return handleWebSocket(request, env, ctx);
-      }
       const url = new URL(request.url);
       const cfg = Config.fromEnv(env);
 
-      // --- SMART API ENDPOINT FOR NETWORK INFO ---
+      // Route for WebSocket (VLESS) connections
+      if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+        return handleWebSocket(request, env, ctx);
+      }
+
+      // *** NEW FEATURE: Handle DNS-over-HTTPS requests ***
+      if (url.pathname === '/dns-query' && (request.method === 'POST' || request.method === 'GET')) {
+        return handleDnsQuery(request, cfg.dohUpstreamUrl);
+      }
+
+      // Route for the smart network info API
       if (url.pathname === '/api/network-info') {
         return handleNetworkInfo(request, cfg);
       }
 
-      // --- HTTP routes for Admin Panel, Subscriptions, etc. ---
+      // Routes for Admin Panel, Subscriptions, etc.
       if (!env.DB || !env.KV) return new Response('Service Unavailable: D1 or KV binding is not configured.', { status: 503 });
       if (!env.ADMIN_KEY) console.error('CRITICAL: ADMIN_KEY secret is not set in environment variables.');
-      
+
       if (url.pathname.startsWith('/admin')) return handleAdminRoutes(request, env);
-      
+
       const parts = url.pathname.slice(1).split('/');
       let userID;
       if ((parts[0] === 'xray' || parts[0] === 'sb') && parts.length > 1) {
@@ -67,11 +85,11 @@ export default {
       } else if (parts.length === 1 && isValidUUID(parts[0])) {
         userID = parts[0];
       }
-      
+
       if (userID && await isValidUser(userID, env, ctx)) {
         return handleConfigPage(userID, url.hostname, cfg.proxyAddress);
       }
-      
+
       return new Response('404 Not Found. Please use your unique user ID in the URL.', { status: 404 });
     } catch (err) {
       console.error('Unhandled Exception:', err);
@@ -80,32 +98,54 @@ export default {
   },
 };
 
-// --- NEW SMART API ENDPOINT FOR NETWORK INFO ---
+// --- DNS-OVER-HTTPS (DoH) PROXY FUNCTION ---
+async function handleDnsQuery(request, upstreamUrl) {
+  const url = new URL(request.url);
+  const upstreamWithQuery = new URL(upstreamUrl);
+  upstreamWithQuery.search = url.search;
+
+  const dohRequest = new Request(upstreamWithQuery, {
+    method: request.method,
+    headers: {
+        'Content-Type': 'application/dns-message',
+        'Accept': 'application/dns-message',
+        'User-Agent': request.headers.get('User-Agent') || 'Cloudflare-Worker-DoH-Proxy'
+    },
+    body: request.method === 'POST' ? request.body : null,
+  });
+
+  try {
+    const dohResponse = await fetch(dohRequest);
+    return dohResponse;
+  } catch (e) {
+    console.error('DoH proxy failed:', e);
+    return new Response('DNS query proxy failed', { status: 502 });
+  }
+}
+
+// --- SMART API ENDPOINT FOR NETWORK INFO ---
 async function handleNetworkInfo(request, config) {
     const clientIp = request.headers.get('CF-Connecting-IP');
     const proxyHost = config.proxyIP;
 
-    // Helper to fetch IP details from a reliable provider
     const getIpDetails = async (ip) => {
         if (!ip) return null;
         try {
-            // Using a reliable and free IP geolocation service
             const response = await fetch(`https://ipinfo.io/${ip}/json`);
             if (!response.ok) throw new Error(`ipinfo.io status: ${response.status}`);
             const data = await response.json();
             return {
                 ip: data.ip,
                 city: data.city,
-                country: data.country, // ipinfo provides country code
+                country: data.country,
                 isp: data.org,
             };
         } catch (error) {
             console.error(`Failed to fetch details for IP ${ip}:`, error);
-            return { ip }; // Return at least the IP on failure
+            return { ip };
         }
     };
 
-    // Helper to get Scamalytics data for risk assessment
     const getScamalyticsDetails = async (ip) => {
         if (!ip || !config.scamalytics.apiKey || !config.scamalytics.username) return null;
         try {
@@ -119,14 +159,13 @@ async function handleNetworkInfo(request, config) {
             return null;
         }
     };
-    
-    // Fetch all data in parallel for maximum speed
+
     const [clientDetails, proxyDetails, scamalyticsData] = await Promise.all([
         getIpDetails(clientIp),
         getIpDetails(proxyHost),
         getScamalyticsDetails(clientIp)
     ]);
-    
+
     const responseData = {
         client: {
             ...clientDetails,
@@ -137,11 +176,11 @@ async function handleNetworkInfo(request, config) {
             ...proxyDetails
         }
     };
-    
+
     return new Response(JSON.stringify(responseData), {
-        headers: { 
+        headers: {
             'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*' // Allow cross-origin requests if needed
+            'Access-Control-Allow-Origin': '*'
         },
     });
 }
@@ -156,7 +195,7 @@ async function handleWebSocket(request, env, ctx) {
   const log = (info, event) => console.log(`[WS] ${info}`, event || '');
   const earlyDataHeader = request.headers.get('Sec-WebSocket-Protocol') || '';
   const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
-  
+
   let remoteSocketWrapper = { value: null };
   let isHeaderProcessed = false;
 
@@ -182,9 +221,9 @@ async function handleWebSocket(request, env, ctx) {
         log('UDP is not supported.');
         return controller.error(new Error('UDP not supported'));
       }
-      
+
       const initialClientData = chunk.slice(rawDataIndex);
-      
+
       const remoteSocket = await handleTCPOutbound({
         addressRemote,
         portRemote,
@@ -197,7 +236,7 @@ async function handleWebSocket(request, env, ctx) {
       if (!remoteSocket) {
         return controller.error(new Error('Failed to establish remote connection.'));
       }
-      
+
       remoteSocketWrapper.value = remoteSocket;
       isHeaderProcessed = true;
 
@@ -380,7 +419,6 @@ function base64ToArrayBuffer(base64Str) {
 
 // --- ALL OTHER FUNCTIONS (Admin Panel, HTML pages, subscriptions, etc.) ---
 
-// --- CORE LOGIC & LINK GENERATION ---
 function generateRandomPath(length = 12, query = '') {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let result = '';
@@ -563,7 +601,7 @@ function generateBeautifulConfigPage(userID, hostName, proxyAddress) {
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@300..700&display=swap" rel="stylesheet">
-    <style>${getPageCSS()}</style> 
+    <style>${getPageCSS()}</style>
   </head>
   <body data-proxy-ip="${proxyAddress}">
     ${getPageHTML(configs, clientUrls)}
@@ -619,8 +657,6 @@ function getAdminDashboardHTML() {
 }
 
 function getPageCSS() {
-  // This function contains the full CSS for the page.
-  // It is kept as is because it's well-structured.
   return `
       * {
         margin: 0;
@@ -824,7 +860,7 @@ function getPageCSS() {
  .client-buttons { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
          .button { padding: 3px 6px; font-size: 10px; } .copy-buttons { font-size: 9px; } .footer { font-size: 7px; }
        }
-     
+
        @media (min-width: 360px) { .container { max-width: 95%; } }
        @media (min-width: 480px) { .container { max-width: 90%; } }
        @media (min-width: 640px) { .container { max-width: 600px; } }
@@ -834,8 +870,6 @@ function getPageCSS() {
 }
 
 function getPageHTML(configs, clientUrls) {
-  // This HTML structure is designed to show loading skeletons initially.
-  // It is correct and does not need changes.
   return `
     <div class="container">
       <div class="header">
@@ -936,8 +970,6 @@ function getPageHTML(configs, clientUrls) {
   `;
 }
 
-// --- MODIFIED CLIENT-SIDE SCRIPT ---
-// This script is now much simpler, faster, and more reliable.
 function getPageScript() {
   return `
       function copyToClipboard(button, text) {
@@ -973,7 +1005,7 @@ function getPageScript() {
         const c_loc = [client.city, client.country].filter(Boolean).join(', ');
         const c_flag = client.country ? \`<img src="https://flagcdn.com/w20/\${client.country.toLowerCase()}.png" class="country-flag" alt="\${client.country}"> \` : '';
         document.getElementById('client-location').innerHTML = (c_loc) ? \`\${c_flag}\${c_loc}\` : 'N/A';
-        
+
         // Update Risk Score Badge
         const risk = client.risk;
         let riskText = "Unknown";
@@ -997,7 +1029,6 @@ function getPageScript() {
             updateDisplay(data);
         } catch (error) {
             console.error('Failed to load network info:', error);
-            // In case of error, show N/A everywhere
             const errorData = { client: {}, proxy: { host: document.body.getAttribute('data-proxy-ip') } };
             updateDisplay(errorData);
         }
@@ -1033,3 +1064,4 @@ function getPageScript() {
       document.addEventListener('DOMContentLoaded', loadNetworkInfo);
   `;
 }
+
